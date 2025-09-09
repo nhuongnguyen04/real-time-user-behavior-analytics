@@ -1,0 +1,82 @@
+startDelaySeconds: 0
+lowercaseOutputName: true
+lowercaseOutputLabelNames: true
+
+rules:
+  # Broker metrics
+  - pattern: "kafka.server<type=BrokerTopicMetrics, name=(BytesInPerSec)><>Count"
+    name: kafka_broker_bytes_in_total
+    type: COUNTER
+  - pattern: "kafka.server<type=BrokerTopicMetrics, name=(BytesOutPerSec)><>Count"
+    name: kafka_broker_bytes_out_total
+    type: COUNTER
+  - pattern: "kafka.server<type=BrokerTopicMetrics, name=(MessagesInPerSec)><>Count"
+    name: kafka_broker_messages_in_total
+    type: COUNTER
+  - pattern: "kafka.server<type=ReplicaManager, name=UnderReplicatedPartitions><>Value"
+    name: kafka_broker_under_replicated_partitions
+    type: GAUGE
+  - pattern: "kafka.controller<type=KafkaController, name=ActiveControllerCount><>Value"
+    name: kafka_controller_active_count
+    type: GAUGE
+  - pattern: "kafka.controller<type=KafkaController, name=OfflinePartitionsCount><>Value"
+    name: kafka_controller_offline_partitions_count
+    type: GAUGE
+
+  # Request metrics
+  - pattern: "kafka.network<type=RequestMetrics, name=RequestsPerSec, request=(Produce|FetchConsumer|FetchFollower)><>Count"
+    name: kafka_request_total
+    labels:
+      request: "$1"
+    type: COUNTER
+  - pattern: "kafka.network<type=RequestMetrics, name=TotalTimeMs, request=(Produce|FetchConsumer|FetchFollower)><>Mean"
+    name: kafka_request_latency_ms
+    labels:
+      request: "$1"
+    type: GAUGE
+
+  # Thread pool
+  - pattern: "kafka.server<type=KafkaRequestHandlerPool, name=RequestHandlerAvgIdlePercent><>Value"
+    name: kafka_request_handler_idle_percent
+    type: GAUGE
+
+  # Log flush
+  - pattern: "kafka.log<type=LogFlushStats, name=LogFlushRateAndTimeMs><>Mean"
+    name: kafka_log_flush_time_ms
+    type: GAUGE
+
+  # CPU usage
+  - pattern: 'java.lang<type=OperatingSystem><>(ProcessCpuLoad|SystemCpuLoad)'
+    name: jvm_cpu_$1
+    type: GAUGE
+
+  # JVM memory
+  - pattern: 'java.lang<type=Memory><>(HeapMemoryUsage|NonHeapMemoryUsage)'
+    name: jvm_memory_$1
+    type: GAUGE
+
+  # GC time
+  - pattern: 'java.lang<type=GarbageCollector, name=(.+)><>(CollectionTime|CollectionCount)'
+    name: jvm_gc_$1_$2
+    type: COUNTER
+
+  # Messages In Per Topic
+  - pattern: 'kafka.server<type=BrokerTopicMetrics, name=MessagesInPerSec, topic=(.+)><>(Count|OneMinuteRate|FiveMinuteRate|MeanRate)'
+    name: kafka_messages_in_per_topic
+    labels:
+      topic: "$1"
+    type: GAUGE
+
+  # Bytes In Per Topic
+  - pattern: 'kafka.server<type=BrokerTopicMetrics, name=BytesInPerSec, topic=(.+)><>(Count|OneMinuteRate|FiveMinuteRate|MeanRate)'
+    name: kafka_bytes_in_per_topic
+    labels:
+      topic: "$1"
+    type: GAUGE
+
+  # Bytes Out Per Topic
+  - pattern: 'kafka.server<type=BrokerTopicMetrics, name=BytesOutPerSec, topic=(.+)><>(Count|OneMinuteRate|FiveMinuteRate|MeanRate)'
+    name: kafka_bytes_out_per_topic
+    labels:
+      topic: "$1"
+    type: GAUGE

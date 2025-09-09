@@ -17,6 +17,7 @@ services:
     ports:
       - "9092:9092"
       - "9093:9093"
+      - "7071:7071"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
@@ -26,33 +27,22 @@ services:
       KAFKA_CONFLUENT_SUPPORT_METRICS_ENABLE: 'false'
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:9093
+      KAFKA_OPTS: "-javaagent:/opt/jmx_exporter/jmx_prometheus_javaagent-1.4.0.jar=7071:/opt/jmx_exporter/kafka.yml"
+    volumes:
+      - ./jmx-config:/opt/jmx_exporter
     networks:
       - kafka-net
-  
-  kafka-connect:
-    build:
-      context: .
-      dockerfile: kafka/connector/Dockerfile
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:latest
+    ports:
+      - "9308:9308"
     environment:
-      CONNECT_BOOTSTRAP_SERVERS: "kafka:9092"
-      CONNECT_REST_ADVERTISED_HOST_NAME: "kafka-connect"
-      CONNECT_GROUP_ID: "connect-cluster"
-      CONNECT_CONFIG_STORAGE_TOPIC: _connect-configs
-      CONNECT_OFFSET_STORAGE_TOPIC: _connect-offsets
-      CONNECT_STATUS_STORAGE_TOPIC: _connect-status
-      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
-      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
-      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
-      CONNECT_KEY_CONVERTER: "org.apache.kafka.connect.storage.StringConverter"
-      CONNECT_VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
-      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
-      CONNECT_PLUGIN_PATH: "/usr/share/confluent-hub-components,/usr/share/java"
-      CONNECT_REST_PORT: 8083
+      KAFKA_SERVER: kafka:9092
+      KAFKA_VERSION: 3.6.0
+      TLS_ENABLE: "false"
     depends_on:
       - kafka
-      - elasticsearch
-    ports:
-      - "8083:8083"
     networks:
       - kafka-net
 
@@ -65,10 +55,13 @@ services:
       - SPARK_MASTER_HOST=spark
       - SPARK_MASTER_PORT=7077
       - SPARK_UI_PORT=8080
+      - SPARK_DAEMON_JAVA_OPTS=-javaagent:/opt/jmx_exporter/jmx_prometheus_javaagent-1.4.0.jar=8085:/opt/jmx_exporter/spark.yml
     ports:
       - "7077:7077"
       - "8080:8080"
+      - "8085:8085"
     volumes:
+      - ./jmx-config:/opt/jmx_exporter
       - ./spark/spark_app:/opt/spark-apps
       - ./spark/checkpoint:/opt/spark/spark-checkpoints
       - ./logs:/opt/spark/logs
@@ -83,11 +76,14 @@ services:
       - SPARK_MODE=worker
       - SPARK_MASTER_URL=spark://spark:7077
       - SPARK_WORKER_PORT=8081
+      - SPARK_DAEMON_JAVA_OPTS=-javaagent:/opt/jmx_exporter/jmx_prometheus_javaagent-1.4.0.jar=8086:/opt/jmx_exporter/spark.yml
     depends_on:
       - spark
     ports:
       - "8081:8081"
+      - "8086:8086"
     volumes:
+      - ./jmx-config:/opt/jmx_exporter
       - ./spark/spark_app:/opt/spark-apps
       - ./spark/checkpoint:/opt/spark/spark-checkpoints
       - ./logs:/opt/spark/logs
@@ -110,6 +106,16 @@ services:
     networks:
       - kafka-net
 
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest
+    ports:
+      - "9187:9187"
+    environment:
+      DATA_SOURCE_NAME: "postgresql://user:password@postgres:5432/realtime_db?sslmode=disable"
+    depends_on:
+      - postgres
+    networks:
+      - kafka-net
 
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
@@ -149,11 +155,23 @@ services:
       - "3000:3000"
     depends_on:
       - postgres
+      - elasticsearch
     environment:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin
     volumes:
       - grafana_data:/var/lib/grafana
+    networks:
+      - kafka-net
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - kafka-exporter
     networks:
       - kafka-net
 

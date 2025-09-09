@@ -5,8 +5,8 @@ import math
 import os
 import json
 from typing import Dict, List
-from datetime import datetime, time
-
+import time
+from datetime import datetime
 import concurrent
 import psycopg2
 from psycopg2.extras import execute_values
