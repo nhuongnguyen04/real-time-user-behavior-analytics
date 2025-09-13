@@ -46,6 +46,19 @@ services:
     networks:
       - kafka-net
 
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.0
+    depends_on: 
+      - kafka
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:9092
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_LISTENERS: http://schema-registry:8081
+    networks:
+      - kafka-net
+
   spark:
     build:
       context: .
@@ -75,12 +88,13 @@ services:
     environment:
       - SPARK_MODE=worker
       - SPARK_MASTER_URL=spark://spark:7077
-      - SPARK_WORKER_PORT=8081
+      - SPARK_WORKER_PORT=7078
+      - SPARK_WORKER_WEBUI_PORT=8082
       - SPARK_DAEMON_JAVA_OPTS=-javaagent:/opt/jmx_exporter/jmx_prometheus_javaagent-1.4.0.jar=8086:/opt/jmx_exporter/spark.yml
     depends_on:
       - spark
     ports:
-      - "8081:8081"
+      - "8082:8082"
       - "8086:8086"
     volumes:
       - ./jmx-config:/opt/jmx_exporter
@@ -120,7 +134,7 @@ services:
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     ports:
-      - "8082:8080"
+      - "8083:8080"
     environment:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092

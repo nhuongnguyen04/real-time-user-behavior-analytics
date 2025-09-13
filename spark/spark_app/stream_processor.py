@@ -4,20 +4,34 @@ import logging
 import math
 import os
 import json
+import traceback
 from typing import Dict, List
 import time
 from datetime import datetime
 import concurrent
+import requests
 import psycopg2
 from psycopg2.extras import execute_values
 
 
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import from_json, col, to_timestamp, window, count
+from pyspark.sql.functions import from_json, col, to_timestamp, window, count, current_timestamp, length, lit
 from pyspark.sql.types import StructType, StructField, IntegerType, StringType, TimestampType
 
 from elasticsearch import Elasticsearch, helpers
-from kafka import KafkaProducer
+
+
+# from_avro available when spark-avro package is present
+try: 
+    from pyspark.sql.avro.functions import from_avro
+except Exception:
+    from_avro = None
+
+# Optional kafka producer (for alerts & DLQ)
+try:
+    from kafka import KafkaProducer
+except Exception:
+    KafkaProducer = None
 # ==========================
 # CONFIG (edit via env when possible)
 # ==========================
@@ -26,7 +40,8 @@ KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "user_events")
 KAFKA_ALERT_TOPIC = os.getenv("KAFKA_ALERT_TOPIC", "anomaly_alerts")
 KAFKA_DLQ_TOPIC = os.getenv("KAFKA_DLQ_TOPIC", "dead_letter_topic")
 
-
+SCHEMA_REGISTRY_URL = os.getenv("SCHEMA_REGISTRY_URL", "http://schema-registry:8081")
+SCHEMA_SUBJECT = os.getenv("SCHEMA_SUBJECT", "user_events-value")
 
 POSTGRES_URL = os.getenv("POSTGRES_URL", "jdbc:postgresql://postgres:5432/realtime_db")
 POSTGRES_USER = os.getenv("POSTGRES_USER", "user")
@@ -51,6 +66,10 @@ WINDOW_SLIDE = os.getenv("WINDOW_SLIDE", "5 seconds")
 WATERMARK_5S = "30 seconds"
 WATERMARK_1MIN = "2 minutes"
 Z_THRESHOLD = float(os.getenv("Z_THRESHOLD", "2.0"))
+
+# Data quality
+VALID_ACTIONS = os.getenv("VALID_ACTIONS", "click,view,purchase,add_to_cart").split(",")
+MAX_LOCATION_LEN = int(os.getenv("MAX_LOCATION_LEN", "200"))
 
 # Logging
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -134,7 +153,24 @@ def get_alert_producer(max_retries=3, retry_delay=5):
         _alert_producer = None
     return _alert_producer
         
-
+# ----------------------
+# Fetch schema from Schema Registry
+# ----------------------
+def fetch_avro_schema_from_registry(subject: str, sr_url: str) -> str:
+    try:
+        url = f"{sr_url}/subjects/{subject}/versions/latest"
+        resp = requests.get(url, timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        schema_str = data.get("schema")
+        if schema_str:
+            logger.info("Fetched schema for subject %s from Schema Registry", subject)
+            return schema_str
+        else:
+            raise ValueError("Schema not found in response")
+    except Exception as e:
+        logger.error("Failed fetching schema from registry: %s", e)
+        return None
 # ==========================
 # Spark session
 # ==========================
@@ -151,20 +187,18 @@ users_df = spark.read.jdbc(
     properties={"user": POSTGRES_USER, "password": POSTGRES_PASSWORD}
 ).cache()
 
-# ==========================
-# Schema for incoming Kafka JSON
-# ==========================
-event_schema = StructType([
-    StructField("user_id", IntegerType(), False),
-    StructField("product_id", IntegerType(), False),
-    StructField("action", StringType(), False),
-    StructField("timestamp", TimestampType(), False),  # iso string from producer
-    StructField("device_id", StringType(), True),
-    StructField("device_type", StringType(), True),
-    StructField("location", StringType(), True),
-    StructField("user_segment", StringType(), True),
-    StructField("ip_address", StringType(), True)
-])
+# ----------------------
+# If using Avro from Schema Registry: get JSON schema string
+# ----------------------
+SCHEMA_JSON = None
+if SCHEMA_REGISTRY_URL and SCHEMA_SUBJECT:
+    SCHEMA_JSON = fetch_avro_schema_from_registry(SCHEMA_SUBJECT, SCHEMA_REGISTRY_URL)
+    if SCHEMA_JSON is None:
+        logger.warning("No schema available from Schema Registry. Ensure SR is running and subject is correct.")
+    elif from_avro is None:
+        logger.warning("from_avro function not available. Ensure spark-avro package is provided to Spark submit.")
+
+
 
 # ==========================
 # Read from Kafka
@@ -178,20 +212,99 @@ kafka_df = spark.readStream \
     .option("maxOffsetsPerTrigger", 1000) \
     .load()
 
-parsed = kafka_df.selectExpr("CAST(value AS STRING) as json_str") \
-    .select(from_json(col("json_str"), event_schema, {"timestampFormat": "yyyy-MM-dd'T'HH:mm:ss.SSSSSS"}).alias("data")) \
-    .filter(col("data").isNotNull()) \
-    .select("data.*") \
-    .withColumn("event_time", col("timestamp")) \
-    .dropna(subset=["user_id", "product_id", "action", "event_time"]) \
-    .repartition("user_id")
+if SCHEMA_JSON and from_avro is not None:
+    parsed = kafka_df.select(from_avro(col("value"), json.loads(SCHEMA_JSON)).alias("data")) \
+        .filter(col("data").isNotNull()) \
+        .select("data.*") \
+        .withColumn("event_time", (col("timestamp")/1000).cast(TimestampType())) \
+        .dropna(subset=["user_id", "product_id", "action", "event_time"]) \
+        .filter(col("action").isin(VALID_ACTIONS)) \
+        .filter(length(col("location")) <= MAX_LOCATION_LEN) \
+        .repartition("user_id")
+    logger.info("Using from_avro with schema from Schema Registry")
+else:
+    # Fallback: define schema manually (if no schema registry)
+    parsed = kafka_df.selectExpr("CAST(value AS STRING) as json_str") \
+        .select(from_json(col("json_str"), StructType([
+            StructField("user_id", IntegerType(), False),
+            StructField("product_id", IntegerType(), False),
+            StructField("action", StringType(), False),
+            StructField("timestamp", StringType(), False),
+            StructField("device_id", StringType(), True),
+            StructField("device_type", StringType(), True),
+            StructField("location", StringType(), True),
+            StructField("user_segment", StringType(), True),
+            StructField("ip_address", StringType(), True)
+        ])).alias("data")) \
+        .filter(col("data").isNotNull()) \
+        .select("data.*") \
+        .withColumn("event_time", to_timestamp(col("timestamp"))) \
+        .dropna(subset=["user_id", "product_id", "action", "event_time"]) \
+        .repartition("user_id")
 
 # Print schema for debugging
 logger.info("Parsed schema: %s", parsed.schema)
 
+def validate_df(df):
+    cond_user = (col("user_id").isNotNull() & (col("user_id") > 0))
+    cond_product = (col("product_id").isNotNull() & (col("product_id") > 0))
+    cond_action = col("action").isin(*VALID_ACTIONS) if VALID_ACTIONS else col("action").isNotNull()
+    cond_time = col("event_time") <= current_timestamp()
+    cond_loc_len = length(col("location")) <= MAX_LOCATION_LEN
+    valid = cond_user & cond_product & cond_action & cond_time & cond_loc_len
+    
+    valid_df = df.filter(valid)
+    invalid_df = df.filter(~valid)
+    
+    #attach reason - use UDF for complex reasons
+    invalid_df = invalid_df.withColumn("dq_reason",lit(None).cast(StringType()))
+    from pyspark.sql.functions import udf
+    def reason_fn(user_id, product_id, action, event_time, location):
+        reasons = []
+        if user_id is None or (isinstance(user_id, int) and user_id <= 0):
+            reasons.append("invalid_user_id")
+        if product_id is None or (isinstance(product_id, int) and product_id <= 0):
+            reasons.append("invalid_product_id")
+        if action not in VALID_ACTIONS:
+            reasons.append("invalid_action")
+        if event_time is None or event_time > datetime.utcnow():
+            reasons.append("invalid_event_time")
+        if location and len(location) > MAX_LOCATION_LEN:
+            reasons.append("location_too_long")
+        return ",".join(reasons) if reasons else None
+    reason_udf = udf(reason_fn, StringType())
+    invalid_df = invalid_df.withColumn("dq_reason", reason_udf(col("user_id"), col("product_id"), col("action"), col("event_time"), col("location")))
+    return valid_df, invalid_df
+
+# ----------------------
+# Dead-letter: send invalid rows to DLQ topic
+# ----------------------
+def publish_invalid_to_dlq(invalid_df, batch_id):
+    try:
+        if invalid_df.rdd.isEmpty():
+            logger.info("[DLQ] Batch %s empty -> skip", batch_id)
+            return
+        prod = get_alert_producer()
+        if not prod:
+            logger.warning("No kafka producer available to publish DLQ records. Count=%d", invalid_df.count())
+            return
+        sent = 0
+        for row in invalid_df.toLocalIterator():
+            try:
+                msg = {"batch_id": batch_id, "row": row.asDict(),"dq_reason": row["dq_reason"], "reported_at": datetime.utcnow().isoformat()}
+                prod.send(KAFKA_DLQ_TOPIC, msg)
+                sent += 1
+            except Exception as e:
+                logger.exception("[ERROR] publish_invalid_to_dlq exception for batch %s: %s", batch_id, e)
+        prod.flush(timeout=5)
+        logger.info("Published %d invalid rows to DLQ topic %s", sent, KAFKA_DLQ_TOPIC)
+    except Exception as e:
+        logger.exception("[ERROR] publish_invalid_to_dlq exception for batch %s: %s", batch_id, e)
 
 # ==========================
 # 1) Write raw events to Postgres (via JDBC) - drop event_time
+# existing helpers for COPY, send_chunk_to_dlq, foreach_write_raw...
+# Minimal copy of previously working implementations (kept concise)
 # ==========================
 def row_to_copy_buffer(row: List, columns: List[str]) -> io.StringIO:
     # Convert list of Row objects to a text buffer understood by COPY (tab-separated, \N for null).
@@ -216,30 +329,21 @@ def row_to_copy_buffer(row: List, columns: List[str]) -> io.StringIO:
     return buf
 
 # Dead-letter: send chunk to DLQ
-def send_chunk_to_dlq(chunk_rows: List, batch_id: int, reason: str, max_retries=3):
+def send_chunk_to_dlq(chunk_rows: List, reason: str):
     prod = get_alert_producer()
     if not prod:
         logger.warning("No Kafka producer for DLQ; dropping %d rows", len(chunk_rows))
-        with open("tmp/dlq.log", "a") as f:
-            for r in chunk_rows:
-                f.write(json.dumps({"reason": reason, "batch_id": batch_id, "row": r, "reported_at": datetime.utcnow().isoformat()}) + "\n")
         return
-    if not chunk_rows:
-        return
-    logger.warning("Sending batch %d to DLQ: %s", batch_id, chunk_rows)
-    for attempt in range(max_retries):
+    for r in chunk_rows:
+        msg = {"reason": reason, "row": r, "reported_at": datetime.utcnow().isoformat()}
         try:
-            for r in chunk_rows:
-                msg = {"reason": reason, "batch_id": batch_id, "row": r, "reported_at": datetime.utcnow().isoformat()}
-                prod.send(KAFKA_DLQ_TOPIC, msg)
-            prod.flush(timeout=5)
-            logger.info("Sent %d rows to DLQ", len(chunk_rows))
-            return
+            prod.send(KAFKA_DLQ_TOPIC, msg)
         except Exception as e:
-            logger.warning("DLQ attempt %d failed: %s", attempt + 1, e)
-            if attempt < max_retries - 1:
-                time.sleep(1)  # wait before retrying
-    logger.error("Failed to send %d rows to DLQ after %d attempts", len(chunk_rows), max_retries)
+            logger.warning("Failed sending DLQ message: %s", e)
+    try:
+        prod.flush(timeout=5)
+    except Exception:
+        pass
 
 def foreach_write_raw(batch_df, batch_id):
 
@@ -264,10 +368,6 @@ def foreach_write_raw(batch_df, batch_id):
             col("user_segment"),
             col("ip_address")
         )
-        
-        # Convert partitions -> rows in chunks
-        # Use .toLocalIterator() to avoid collecting all at once
-        
         cols = ["user_id","product_id","action","timestamp","device_id","device_type","location","user_segment","ip_address"]
         it = selected.toLocalIterator()
         chunk = []
@@ -279,7 +379,6 @@ def foreach_write_raw(batch_df, batch_id):
                 try:
                     row = next(it)
                 except StopIteration:
-                    # flush last chunk
                     if chunk:
                         buf = row_to_copy_buffer(chunk, cols)
                         try:
@@ -289,9 +388,9 @@ def foreach_write_raw(batch_df, batch_id):
                         except Exception as e:
                             conn.rollback()
                             logger.warning("Failed COPY-ing chunk to user_events: %s", e)
-                            send_chunk_to_dlq(chunk, batch_id, str(e))
+                            send_chunk_to_dlq(chunk, str(batch_id), str(e))
                     break
-                chunk.append(row.asDict())
+                chunk.append(row)
                 if len(chunk) >= COPY_CHUNK:
                     buf = row_to_copy_buffer(chunk, cols)
                     try:
@@ -301,7 +400,7 @@ def foreach_write_raw(batch_df, batch_id):
                     except Exception as e:
                         conn.rollback()
                         logger.warning("Failed COPY-ing chunk to user_events: %s", e)
-                        send_chunk_to_dlq(chunk, batch_id, str(e))
+                        send_chunk_to_dlq(chunk, str(batch_id), str(e))
                     chunk = []
             logger.info("[raw] Batch %s COPY-ed %d rows to user_events", batch_id, sent)
             es = get_es_client()
@@ -321,11 +420,30 @@ def foreach_write_raw(batch_df, batch_id):
                 pass  
     except Exception as e:
          logger.exception("[ERROR] write_raw_via_copy exception for batch %s: %s", batch_id, e)
+         
+# ----------------------
+# Validation + routing foreachBatch entrypoint
+# ----------------------
+def foreach_validate_and_route(batch_df, batch_id):
+    try:
+        if batch_df.rdd.isEmpty():
+            logger.info("[validate] Batch %s empty -> skip", batch_id)
+            return
+        valid_df, invalid_df = validate_df(batch_df)
+        # Publish invalid rows to DLQ
+        publish_invalid_to_dlq(invalid_df, batch_id)
+        # Write valid rows to raw table
+        if not valid_df.rdd.isEmpty():
+            foreach_write_raw(valid_df, batch_id)
+        else:
+            logger.info("[validate] Batch %s has no valid rows after validation -> skip writing", batch_id)
+    except Exception as e:
+        logger.exception("[ERROR] foreach_validate_and_route exception for batch %s: %s", batch_id, e)
 # Start raw stream
 
 raw_query = parsed.writeStream \
     .outputMode("append") \
-    .foreachBatch(foreach_write_raw) \
+    .foreachBatch(foreach_validate_and_route) \
     .option("checkpointLocation", f"{CHECKPOINT_BASE}/user_events") \
     .trigger(processingTime=PROCESSING_TRIGGER) \
     .start()

@@ -1,20 +1,49 @@
-from kafka import KafkaProducer
-import json
 import time
 import random
+import os
 from datetime import datetime
-from kafka.errors import KafkaError
+from confluent_kafka.avro import AvroProducer, CachedSchemaRegistryClient
+from confluent_kafka.avro import loads
+
+BROKER = os.getenv("KAFKA_BROKER", "localhost:9093")
+SCHEMA_REGISTRY = os.getenv("SCHEMA_REGISTRY_URL", "http://localhost:8081")
+TOPIC = "user_events"
+
+schema_registry_client = CachedSchemaRegistryClient({'url': SCHEMA_REGISTRY})
+
+schema_schema_str = """
+{
+  "namespace": "user.events",
+  "type": "record",
+  "name": "UserEvent",
+  "fields": [
+    {"name": "user_id", "type": "int"},
+    {"name": "product_id", "type": "int"},
+    {"name": "action", "type": "string"},
+    {"name": "timestamp", "type": "long", "logicalType": "timestamp-millis"},
+    {"name": "device_id", "type": ["null", "string"], "default": null},
+    {"name": "device_type", "type": ["null", "string"], "default": null},
+    {"name": "location", "type": ["null", "string"], "default": null},
+    {"name": "user_segment", "type": ["null", "string"], "default": null},
+    {"name": "ip_address", "type": ["null", "string"], "default": null}
+  ]
+}
+"""
+
+producer_config = {
+    'bootstrap.servers': BROKER,
+    'schema.registry.url': SCHEMA_REGISTRY,
+    'compression.type': 'snappy',
+    'retries': 5
+}
 
 try:
-    producer = KafkaProducer(
-        bootstrap_servers='localhost:9093',  # Adjust the port if necessary 
-        value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-        retries=5,
-        compression_type='snappy',
-        max_block_ms=10000
+    producer = AvroProducer(
+        producer_config,
+        default_value_schema=loads(schema_schema_str)
     )
-except KafkaError as e:
-    print(f"Lỗi khi khởi tạo Kafka Producer: {e}")
+except Exception as e:
+    print(f"Lỗi khi khởi tạo AvroProducer: {e}")
     exit(1)
 
 actions = ['view', 'click', 'add_to_cart', 'purchase']
@@ -32,11 +61,13 @@ SPAM_USERS = [10, 455, 789, 123, 999]  # Giả sử đây là những người d
 def generate_event():
     is_spammer = random.random() < 0.4  # 40% xác suất là spammer
     user_id = random.choice(SPAM_USERS) if is_spammer else random.choice(user_ids)
+     # Chuyển timestamp sang kiểu long (mili giây)
+    ts = int(datetime.utcnow().timestamp() * 1000)
     return {
         'user_id': user_id,
         'product_id': random.choice(product_ids),
         'action': 'click' if is_spammer else random.choice(actions),
-        'timestamp': datetime.utcnow().isoformat(),
+        'timestamp': ts,
         'device_id': f"device_{random.randint(10000,99999)}",
         'device_type': random.choice(device_types),
         'location': random.choice(locations),
@@ -51,14 +82,13 @@ while True:
         batch.append(generate_event())
         if len(batch) >= batch_size:
             for event in batch:
-                future = producer.send('user_events', value=event)
-                future.get(timeout=10)  # Chờ tối đa 10 giây để gửi
-            producer.flush()    
+                producer.produce(topic=TOPIC, value=event)
+            producer.flush()
             elapsed = time.time() - start_time
             print(f"Đã gửi {len(batch)} sự kiện trong {elapsed:.2f}s giây (~{len(batch) / elapsed:.2f} sự kiện/giây)")
             batch = []
             start_time = time.time()
             time.sleep(0.1)
-    except KafkaError as e:
+    except Exception as e:
         print(f"Lỗi khi gửi message: {e}")
     time.sleep(0.1)
