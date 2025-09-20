@@ -42,4 +42,14 @@ CREATE TABLE users (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS pipeline_metrics (
+    id SERIAL PRIMARY KEY,
+    batch_id BIGINT,
+    schema_version TEXT,
+    valid_count INT,
+    invalid_count INT,
+    ts_processed TIMESTAMP DEFAULT now()
+);
+
+
 
