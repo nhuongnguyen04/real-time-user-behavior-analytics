@@ -83,9 +83,3 @@ Tài liệu thêm
 - `docs/` chứa thông tin chi tiết về kiến trúc và phát triển (nếu có). Nếu bạn muốn, mình sẽ tạo thêm các file: `docs/architecture.md`, `docs/development.md`.
 
 Liên hệ
-- Nếu cần mình có thể:
-  - Tạo tài liệu chi tiết hơn (quy trình dev, kịch bản test, sơ đồ kiến trúc)
-  - Áp các sửa đổi code nhỏ để đồng bộ module với script gốc (ví dụ: bật fallback Avro, thêm COPY-based writes, chuẩn hoá logging)
-
----
-Cần mình tạo thêm file docs (kiến trúc, hướng dẫn dev) không? Nếu có, cho mình biết bạn muốn tiếng Việt hay tiếng Anh, và mức chi tiết (ngắn/đầy đủ).
