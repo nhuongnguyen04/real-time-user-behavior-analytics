@@ -4,8 +4,8 @@ from pyspark.sql.types import StringType
 from pyspark.sql import functions as F
 from datetime import datetime
 
-from .config import VALID_ACTIONS, MAX_LOCATION_LEN, logger, KAFKA_DLQ_TOPIC
-from .helpers import get_alert_producer
+from spark.spark_app.stream_processor.config import VALID_ACTIONS, MAX_LOCATION_LEN, logger, KAFKA_DLQ_TOPIC
+from spark.spark_app.stream_processor.helpers import get_alert_producer
 
 def validate_df(df):
     cond_user = (col("user_id").isNotNull() & (col("user_id") > 0))

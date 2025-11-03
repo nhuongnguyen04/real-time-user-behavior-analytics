@@ -15,7 +15,15 @@ RUN pip3 install --no-cache-dir requests \
     elasticsearch==8.7.0 \
     kafka-python==2.0.2 \
     psycopg2-binary==2.9.6 \
-    python-snappy==0.7.3
+    python-snappy==0.7.3 \
+    pyspark-iforest==0.4.1 \
+    avro-python3==1.10.2 \
+    pytest==7.4.0 \
+    pytest-spark==0.8.0 \
+    chispa==0.11.0 \
+    pandas==2.0.3 \
+    numpy==1.26.4 \
+    scipy==1.11.3 
 
 # ================================
 # JAR cho Kafka, PostgreSQL

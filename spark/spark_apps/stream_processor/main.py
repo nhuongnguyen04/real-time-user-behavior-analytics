@@ -12,6 +12,7 @@ from pyspark.sql.types import (
     StringType,
     TimestampType,
 )
+from pyspark.ml import PipelineModel
 
 # from_avro available when spark-avro package is present
 try:
@@ -19,7 +20,7 @@ try:
 except Exception:
     from_avro = None
 
-from .config import (
+from spark.spark_app.stream_processor.config import (
     KAFKA_BROKER,
     KAFKA_TOPIC,
     SCHEMA_REGISTRY_URL,
@@ -38,8 +39,8 @@ from .config import (
     MAX_LOCATION_LEN,
     logger,
 )
-from .helpers import fetch_avro_schema_from_registry
-from .writers import foreach_validate_and_route, write_summary_and_anomaly
+from spark.spark_app.stream_processor.helpers import fetch_avro_schema_from_registry
+from spark.spark_app.stream_processor.writers import foreach_validate_and_route, write_summary_with_model
 
 # ==========================
 # Spark session
@@ -58,6 +59,17 @@ users_df = spark.read.jdbc(
     properties={"user": POSTGRES_USER, "password": POSTGRES_PASSWORD},
 ).cache()
 
+
+# Load anomaly detection model (KMeans đã train)
+try:
+    anomaly_model = PipelineModel.load("/models/anomaly_kmeans")
+    threshold_df = spark.read.parquet("/models/anomaly_kmeans_threshold")
+    anomaly_threshold = threshold_df.collect()[0]["threshold"]
+    logger.info(f"KMeans model loaded successfully. Threshold={anomaly_threshold}")
+except Exception as e:
+    anomaly_model = None
+    anomaly_threshold = None
+    logger.warning(f"Failed to load anomaly model: {e}")
 # ----------------------
 # If using Avro from Schema Registry: get JSON schema string
 # ----------------------
@@ -140,13 +152,13 @@ windowed_1min = parsed.withWatermark("event_time", WATERMARK_1MIN) \
 # Start windowed stream
 agg_query_5s = windowed_5s.writeStream \
     .outputMode("update") \
-    .foreachBatch(lambda df, id: write_summary_and_anomaly(df, id, "5s")) \
+    .foreachBatch(lambda df, id: write_summary_with_model(df, id, "5s", users_df, anomaly_model, anomaly_threshold)) \
     .option("checkpointLocation", f"{CHECKPOINT_BASE}/user_activity_summary_5s") \
     .start()
 
 agg_query_1min = windowed_1min.writeStream \
     .outputMode("update") \
-    .foreachBatch(lambda df, id: write_summary_and_anomaly(df, id, "1min")) \
+    .foreachBatch(lambda df, id: write_summary_with_model(df, id, "1min", users_df, anomaly_model, anomaly_threshold)) \
     .option("checkpointLocation", f"{CHECKPOINT_BASE}/user_activity_summary_1min") \
     .trigger(processingTime=PROCESSING_TRIGGER) \
     .start()

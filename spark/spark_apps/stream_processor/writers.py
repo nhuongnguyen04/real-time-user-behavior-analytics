@@ -1,16 +1,18 @@
 # /opt/spark-apps/stream_processor/writers.py
 import io
 import json
-import math
+from math import dist
 from datetime import datetime
 import concurrent.futures
+from pyexpat import features
 
 from pyspark.sql import DataFrame
 
 from pyspark.sql.functions import col, broadcast
+from pyspark.ml import PipelineModel
 from psycopg2.extras import execute_values
 
-from .config import (
+from spark.spark_app.stream_processor.config import (
     COPY_CHUNK,
     ES_BULK_CHUNK,
     ANOMALY_THRESHOLD,
@@ -19,7 +21,7 @@ from .config import (
     KAFKA_ALERT_TOPIC,
     logger,
 )
-from .helpers import (
+from spark.spark_app.stream_processor.helpers import (
     get_psycopg2_conn,
     row_to_copy_buffer,
     send_chunk_to_dlq,
@@ -27,7 +29,7 @@ from .helpers import (
     get_alert_producer,
     helpers as es_helpers,
 )
-from .validation import validate_df, publish_invalid_to_dlq
+from spark.spark_app.stream_processor.validation import validate_df, publish_invalid_to_dlq
 
 
 # ==========================
@@ -156,7 +158,7 @@ def foreach_validate_and_route(batch_df: DataFrame, batch_id: int):
 # window: 1 minute, slide 30 seconds (short window as requested)
 # watermark: 2 minutes
 # ==========================
-def write_summary_and_anomaly(batch_df: DataFrame, batch_id: int, window_type: str, users_df: DataFrame):
+def write_summary_with_model(batch_df: DataFrame, batch_id: int, window_type: str, users_df: DataFrame, anomaly_model: PipelineModel, threshold: float):
     """
     foreachBatch handler for aggregated windowed results.
     Writes summary into user_activity_summary via UPSERT, anomalies into anomalous_events (INSERT ON CONFLICT DO NOTHING),
@@ -184,21 +186,15 @@ def write_summary_and_anomaly(batch_df: DataFrame, batch_id: int, window_type: s
             col("region"),
         )
     rows = enriched_df.collect()
-
     if not rows:
         logger.info(f"[agg] Batch {batch_id} ({window_type} window) has no summary rows -> skip")
         return
-
     # Prepare data tuples for upsert
     upsert_tuples = [(r["window_start"], r["window_end"], int(r["user_id"]), int(r["event_count"])) for r in rows]
-    # Compute simple batch-level statistics for z-score detection
-    counts = [t[3] for t in upsert_tuples]
-    mean = sum(counts) / len(counts) if counts else 0.0
-    var = sum((x - mean) ** 2 for x in counts) / len(counts) if counts else 0.0
-    stddev = math.sqrt(var)
-    z_threshold = Z_THRESHOLD
-    logger.info(f"[agg] Batch {batch_id} ({window_type} window) mean={mean:.2f}, stddev={stddev:.2f}, z_threshold={z_threshold}")
     
+    # =====================
+    # 1. Ghi summary vào Postgres
+    # =====================
     # Connect to Postgres and upsert
     conn = get_psycopg2_conn()
     cur = conn.cursor()
@@ -221,107 +217,125 @@ def write_summary_and_anomaly(batch_df: DataFrame, batch_id: int, window_type: s
         cur.close()
         conn.close()
 
-    # Detect anomalies: event_count > ANOMALY_THRESHOLD AND z-score > z_threshold
-    anomalies = []
+    # =====================
+    # 2. Apply anomaly model
+    # =====================
+    if anomaly_model is None:
+        logger.warning("[agg-model] No anomaly model loaded, skipping anomaly detection")
+        return
 
-    for i, (ws, we, uid, cnt) in enumerate(upsert_tuples):
-        z = (cnt - mean) / stddev if stddev > 0 else None
-        if cnt > ANOMALY_THRESHOLD and (z is not None and z >= z_threshold):
-            severity = "high" if z > 5 else "medium" if z > 3 else "low"
-            if severity in ["high", "medium"]:
-                anomalies.append(
-                    (
-                        uid,
-                        ws.isoformat(),
-                        we.isoformat(),
-                        cnt,
-                        float(z) if z is not None else 0.0,
-                        severity,
-                        rows[i]["user_name"],
-                        rows[i]["region"],
-                    )
-                )
+    predictions = anomaly_model.transform(enriched_df)
+    centers = anomaly_model.stages[-1].clusterCenters()
+    from pyspark.sql import functions as F
+    import numpy as np
+    @F.udf("double")
+    def dist_to_center(features, cluster):
+        center = centers[cluster]
+        return float(np.linalg.norm(features.toArray() - center))
 
-    # Persist anomalies (psycopg2) with ON CONFLICT DO NOTHING
-    if anomalies:
-        conn = get_psycopg2_conn()
-        cur = conn.cursor()
-        try:
-            anomaly_db_tuples = [(uid, ws_iso, we_iso, cnt) for uid, ws_iso, we_iso, cnt, _, _, _, _ in anomalies]
-            insert_anom_sql = """
-            INSERT INTO anomalous_events (user_id, window_start, window_end, event_count)
+    scored = predictions.withColumn("distance", dist_to_center("features", "cluster"))
+    anomalies_df = scored.filter(F.col("distance") > F.lit(threshold))
+
+    anomalies = [
+        (
+            int(r["user_id"]),
+            r["window_start"].isoformat(),
+            r["window_end"].isoformat(),
+            int(r["event_count"]),
+            float(r["distance"]),
+            r["user_name"],
+            r["region"],
+        )
+        for r in anomalies_df.collect()
+    ]
+
+    if not anomalies:
+        logger.info(f"[agg-model] Batch {batch_id} ({window_type}) no anomalies detected")
+        return
+
+
+    # =====================
+    # 3. Persist anomalies
+    # =====================
+    # 3.1 Ghi vào Postgres
+    # =====================
+    conn = get_psycopg2_conn()
+    cur = conn.cursor()
+    try:
+        anomaly_db_tuples = [(uid, ws_iso, we_iso, cnt, datetime.utcnow(), "kmeans", "distance_threshold") for uid, ws_iso, we_iso, cnt, _, _ in anomalies]
+        insert_anom_sql = """
+            INSERT INTO anomalous_events (user_id, window_start, window_end, event_count, detected_at, detector_type, severity)
             VALUES %s
             ON CONFLICT (user_id, window_start, window_end) DO NOTHING;
             """
             # convert iso strings back to timestamps via psycopg2 by passing them as strings
-            execute_values(cur, insert_anom_sql, anomaly_db_tuples, page_size=200)
-            conn.commit()
-            logger.info(f"[anomaly] Batch {batch_id} wrote {len(anomalies)} anomalies")
-        except Exception as e:
-            logger.error(f"[ERROR] Failed writing anomalies for batch {batch_id}: {e}")
-        finally:
-            cur.close()
-            conn.close()
+        execute_values(cur, insert_anom_sql, anomaly_db_tuples, page_size=200)
+        conn.commit()
+        logger.info(f"[anomaly] Batch {batch_id} wrote {len(anomalies)} anomalies")
+    except Exception as e:
+        logger.error(f"[ERROR] Failed writing anomalies for batch {batch_id}: {e}")
+    finally:
+        cur.close()
+        conn.close()
             
-        # ES bulk index anomalies
-        es = get_es_client()
-        if es:
-            docs = [
-                {
-                    "_index": ES_INDEX,
-                    "_source": {
-                        "type": "anomaly",
-                        "user_id": uid,
-                        "event_count": cnt,
-                        "window_start": ws_iso,
-                        "window_end": we_iso,
-                        "z_score": z,
-                        "severity": severity,
-                        "user_name": user_name,
-                        "region": region,
-                        "detected_at": datetime.utcnow().isoformat(),
-                    }
+      # 3.2 Bulk index ES
+    es = get_es_client()
+    if es:
+        docs = [
+            {
+                "_index": ES_INDEX,
+                "_source": {
+                    "type": "anomaly",
+                    "user_id": uid,
+                    "event_count": cnt,
+                    "window_start": ws_iso,
+                    "window_end": we_iso,
+                    "distance": dist,
+                    "severity": "distance_threshold",
+                    "user_name": user_name,
+                    "region": region,
+                    "detected_at": datetime.utcnow().isoformat(),
                 }
-                for (
-                    uid,
-                    ws_iso,
-                    we_iso,
-                    cnt,
-                    z,
-                    severity,
-                    user_name,
-                    region
-                ) in anomalies
-            ]
-            try:
-                es_helpers.bulk(es, docs, chunk_size=ES_BULK_CHUNK, raise_on_error=False)
-                logger.info(f"[ES] Bulk indexed {len(docs)} anomalies")
-            except Exception as e:
-                logger.error(f"[ERROR] ES bulk index anomalies failed for batch {batch_id}: {e}")
-
-        # Send alerts to Kafka alert topic (batch send & flush once)
-        prod = get_alert_producer() # reuse existing producer
-        if prod and anomalies: 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                for uid, ws_iso, we_iso, cnt, z, severity, user_name, region in anomalies:
-                    alert_msg = {
-                        "user_id": uid,
-                        "user_name": user_name,
-                        "region": region,
-                        "window_start": ws_iso,
-                        "window_end": we_iso,
-                        "event_count": cnt,
-                        "z_score": z,
-                        "severity": severity,
-                        "detected_at": datetime.utcnow().isoformat()
-                    }
-                    executor.submit(lambda msg=alert_msg: open("/tmp/alerts.log", "a").write(json.dumps(msg) + "\n"))
-                    try:
-                        prod.send(KAFKA_ALERT_TOPIC, alert_msg)
-                    except Exception as e:
-                        logger.warning(f"[Kafka] Failed sending alert for anomaly: {e}")
-                prod.flush(timeout=5)
-                logger.info(f"[Kafka] Sent {len(anomalies)} anomaly alerts to {KAFKA_ALERT_TOPIC}")
+            }
+            for (
+                uid,
+                ws_iso,
+                we_iso,
+                cnt,
+                dist,
+                user_name,
+                region
+            ) in anomalies
+        ]
+        try:
+            es_helpers.bulk(es, docs, chunk_size=ES_BULK_CHUNK, raise_on_error=False)
+            logger.info(f"[ES] Bulk indexed {len(docs)} anomalies")
+        except Exception as e:
+            logger.error(f"[ERROR] ES bulk index anomalies failed for batch {batch_id}: {e}")
+    # 3.3 Kafka alerts
+    # Send alerts to Kafka alert topic (batch send & flush once)
+    prod = get_alert_producer() # reuse existing producer
+    if prod and anomalies: 
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            for uid, ws_iso, we_iso, cnt, z, severity, user_name, region in anomalies:
+                alert_msg = {
+                    "user_id": uid,
+                    "user_name": user_name,
+                    "region": region,
+                    "window_start": ws_iso,
+                    "window_end": we_iso,
+                    "event_count": cnt,
+                    "distance": dist,
+                    "severity": "distance_threshold",
+                    "detected_at": datetime.utcnow().isoformat()
+                }
+                executor.submit(lambda msg=alert_msg: open("/tmp/alerts.log", "a").write(json.dumps(msg) + "\n"))
+                try:
+                    prod.send(KAFKA_ALERT_TOPIC, alert_msg)
+                except Exception as e:
+                    logger.warning(f"[Kafka] Failed sending alert for anomaly: {e}")
+            prod.flush(timeout=5)
+        logger.info(f"[Kafka] Sent {len(anomalies)} anomaly alerts to {KAFKA_ALERT_TOPIC}")
         
 
         # Log batch summary to ES
@@ -333,9 +347,6 @@ def write_summary_and_anomaly(batch_df: DataFrame, batch_id: int, window_type: s
                 "window_type": window_type,
                 "records": len(upsert_tuples),
                 "anomalies": len(anomalies),
-                "mean_event_count": mean,
-                "stddev_event_count": stddev,
-                "z_threshold": z_threshold,
                 "logged_at": datetime.utcnow().isoformat(),
             }
             try:

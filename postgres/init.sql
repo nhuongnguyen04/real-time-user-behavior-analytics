@@ -20,6 +20,9 @@ CREATE TABLE anomalous_events (
     window_start VARCHAR(50) NOT NULL,
     window_end VARCHAR(50) NOT NULL,
     event_count INTEGER NOT NULL,
+    detected_at TIMESTAMP DEFAULT NOW(),
+    detector_type VARCHAR(50) DEFAULT 'zscore',
+    severity VARCHAR(20),
     UNIQUE (user_id, window_start, window_end)
 );
 -- Bảng phát hiện bất thường (spam / click nhiều)
@@ -41,15 +44,12 @@ CREATE TABLE users (
     region VARCHAR(50),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+-- Indexes for performance optimization
+CREATE INDEX IF NOT EXISTS idx_user_events_user_id ON user_events(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_events_timestamp ON user_events(timestamp);
 
-CREATE TABLE IF NOT EXISTS pipeline_metrics (
-    id SERIAL PRIMARY KEY,
-    batch_id BIGINT,
-    schema_version TEXT,
-    valid_count INT,
-    invalid_count INT,
-    ts_processed TIMESTAMP DEFAULT now()
-);
+CREATE INDEX IF NOT EXISTS idx_anomalous_events_detected_at
+    ON anomalous_events (detected_at);
 
-
-
+CREATE INDEX IF NOT EXISTS idx_anomalous_events_detector_type
+    ON anomalous_events (detector_type);

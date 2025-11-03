@@ -75,7 +75,9 @@ services:
       - "8085:8085"
     volumes:
       - ./jmx-config:/opt/jmx_exporter
-      - ./spark/spark_app:/opt/spark-apps
+      - ./spark/spark_apps/ML:/opt/spark_apps/ML
+      - ./spark/spark_apps/stream_processor:/opt/spark_apps/stream_processor
+      - ./spark/spark_apps/tests:/opt/spark_apps/tests
       - ./spark/checkpoint:/opt/spark/spark-checkpoints
       - ./logs:/opt/spark/logs
     networks:
@@ -98,7 +100,9 @@ services:
       - "8086:8086"
     volumes:
       - ./jmx-config:/opt/jmx_exporter
-      - ./spark/spark_app:/opt/spark-apps
+      - ./spark/spark_apps/ML:/opt/spark_apps/ML
+      - ./spark/spark_apps/stream_processor:/opt/spark_apps/stream_processor
+      - ./spark/spark_apps/tests:/opt/spark_apps/tests
       - ./spark/checkpoint:/opt/spark/spark-checkpoints
       - ./logs:/opt/spark/logs
     networks:

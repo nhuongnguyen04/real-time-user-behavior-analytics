@@ -13,7 +13,7 @@ try:
 except Exception:
     KafkaProducer = None
 
-from .config import POSTGRES_URL, POSTGRES_USER, POSTGRES_PASSWORD, ES_HOST, KAFKA_BROKER, logger, KAFKA_DLQ_TOPIC
+from spark.spark_apps.stream_processor.config import POSTGRES_URL, POSTGRES_USER, POSTGRES_PASSWORD, ES_HOST, KAFKA_BROKER, logger, KAFKA_DLQ_TOPIC
 # ==========================
 # HELPERS: Postgres connection parsing & connect
 # ==========================
