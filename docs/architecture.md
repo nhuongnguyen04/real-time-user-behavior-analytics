@@ -39,7 +39,3 @@ Fault-tolerance & Exactly-once
 
 Bảo mật
 - Đảm bảo credentials (DB password, ES, SR) quản lý bằng secrets manager / Vault chứ không commit vào repo.
-
-Tiếp theo
-- Nếu muốn, mình có thể thêm sơ đồ (diagram) kiến trúc dạng mermaid hoặc PNG.
-- Thực hiện checklist kiểm tra (test harness) cho producers và unit tests cho logic validation/anomaly.
